@@ -4,6 +4,8 @@ from flask_cors import CORS
 from flask import Flask, jsonify, request, Response
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity, get_jwt
 from werkzeug.security import generate_password_hash, check_password_hash
+from sqlalchemy import or_
+
 import datetime, json, plotly.graph_objs as go, plotly
 import time
 
@@ -83,7 +85,7 @@ def add_transaction():
 
     if not existing_batch:
         # No batch yet → must be created by Farmer
-        if role != "Farmer":
+        if role != "farmer":
             return jsonify({"error": f"Only Farmers can create new batch, but you are {role}"}), 403
     else:
         # Already exists → must be Distributor or Retailer
@@ -393,6 +395,40 @@ def dashboard_stats():
         "delivered": delivered,
         "rejected": rejected
     })
+
+
+@app.route("/my_transactions", methods=["GET"])
+@jwt_required()
+def my_transactions():
+
+    user_email = get_jwt_identity()
+
+    user = User.query.filter_by(email=user_email).first()
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+
+    user_name = user.name
+
+    transactions = TransactionModel.query.filter_by(owner=user_name).all()
+
+    if not transactions:
+        return jsonify({"transactions": []})
+
+    result = []
+    for tx in transactions:
+        # Fetch batch status (if any)
+        batch = BatchModel.query.filter_by(batch_id=tx.batch_id).first()
+        status = batch.status if batch else "Unknown"
+
+        result.append({
+            "batch_id": tx.batch_id,
+            "product": tx.product,
+            "to": tx.owner,  # current owner (name)
+            "date": tx.timestamp,
+            "status": status
+        })
+
+    return jsonify({"transactions": result})
 
 
 @app.route("/log_conditions", methods=["POST"])

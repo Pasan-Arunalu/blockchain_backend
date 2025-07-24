@@ -1,6 +1,6 @@
 import hashlib, json, time
 from models import db, BlockModel, PendingTransferModel, BatchModel
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 @dataclass(frozen=True)
 class Block:
@@ -8,9 +8,9 @@ class Block:
     timestamp: float
     transactions: list
     previous_hash: str
-    hash: str
+    hash: str = field(default="", compare=False)  # default empty, computed later
 
-    def calculate_hash(self):
+    def calculate_hash(self) -> str:
         block_string = json.dumps({
             "index": self.index,
             "timestamp": self.timestamp,
@@ -18,6 +18,11 @@ class Block:
             "previous_hash": self.previous_hash
         }, sort_keys=True)
         return hashlib.sha256(block_string.encode()).hexdigest()
+
+    def __post_init__(self):
+        # ✅ If hash is missing, compute automatically
+        if not self.hash:
+            object.__setattr__(self, "hash", self.calculate_hash())
 
 class Blockchain:
     def __init__(self, use_db=True):
