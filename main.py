@@ -15,7 +15,7 @@ from blockchain import Blockchain
 
 app = Flask(__name__)
 
-CORS(app, origins=["http://localhost:5173"])
+CORS(app, supports_credentials=True, resources={r"/*": {"origins": "http://localhost:5173"}})
 
 # Configs
 app.config["JWT_SECRET_KEY"] = "supersecretkey123"
@@ -31,6 +31,14 @@ jwt = JWTManager(app)
 with app.app_context():
     db.create_all()
     blockchain = Blockchain()
+
+
+@app.after_request
+def after_request(response):
+    response.headers.add("Access-Control-Allow-Headers", "Content-Type,Authorization")
+    response.headers.add("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
+    return response
+
 
 def role_required(allowed_roles):
     def decorator(func):
@@ -85,11 +93,11 @@ def add_transaction():
 
     if not existing_batch:
         # No batch yet → must be created by Farmer
-        if role != "farmer":
+        if role.lower() != "farmer":
             return jsonify({"error": f"Only Farmers can create new batch, but you are {role}"}), 403
     else:
         # Already exists → must be Distributor or Retailer
-        if role not in ["Distributor", "Retailer"]:
+        if role.lower() not in ["distributor", "retailer"]:
             return jsonify({"error": f"Only Distributor/Retailer can transfer ownership, but you are {role}"}), 403
 
     # Save transaction
@@ -97,6 +105,8 @@ def add_transaction():
     blockchain.add_block(tx_data)
     new_tx = TransactionModel(**tx_data)
     db.session.add(new_tx)
+    print("DEBUG - tx_data before saving:", tx_data)
+
     db.session.commit()
 
     return jsonify({"message": "Transaction added successfully!", "role": role})
@@ -254,17 +264,17 @@ def login():
     if not user or not check_password_hash(user.password, password):
         return "Invalid credentials", 401
 
-    # Role is stored as custom claim
     access_token = create_access_token(
         identity=user.email,
-        additional_claims={"role": user.role}
+        additional_claims={"role": user.role, "name": user.name}
     )
 
     return jsonify({
         "message": "Login successful!",
         "access_token": access_token,
         "role": user.role,
-        "name": user.name
+        "name": user.name,
+        "email": user.email
     })
 
 
@@ -281,35 +291,67 @@ def secure_test():
 @jwt_required()
 def transfer_request():
     data = request.get_json()
-    required = ["batch_id", "from", "to"]
+    required = ["batch_id", "from_email", "to_email"]
     for field in required:
         if field not in data:
             return jsonify({"error": f"Missing field: {field}"}), 400
 
     claims = get_jwt()
-    sender_role = claims["role"]
+    sender_role = claims.get("role")
     sender_email = get_jwt_identity()
 
-    # Validate current ownership
+    # Debug logs
+    print(f"[DEBUG] Sender email from JWT: {sender_email}")
+    print(f"[DEBUG] from_email in request data: {data['from_email']}")
+    print(f"[DEBUG] Sender role: {sender_role}")
+    print(f"[DEBUG] Batch ID: {data['batch_id']}")
+
+    # Validate sender matches the JWT identity
+    if sender_email != data["from_email"]:
+        print("[DEBUG] Sender email does not match from_email in request body")
+        return jsonify({"error": "Sender email does not match logged-in user"}), 403
+
+    # Fetch blockchain history for batch
     history = blockchain.get_batch_history(data["batch_id"])
+
+    print(f"[DEBUG] Blockchain history for batch (length): {len(history) if history else 0}")
+    if history:
+        print(f"[DEBUG] Last transaction in history: {history[-1]}")
+
     if not history:
-        # Only Farmer can create new batch
-        if sender_role != "Farmer":
+        # First-time transfer → only Farmers allowed
+        if sender_role.lower() != "farmer":
+            print("[DEBUG] Role not farmer but trying first-time transfer")
             return jsonify({"error": "Only Farmers can initiate first-time transfers"}), 403
     else:
-        latest_owner = history[-1]["to"] if history[-1]["action"] == "ownership_accepted" else history[-1]["from"]
-        if latest_owner != sender_email:
-            return jsonify({"error": f"Only current owner '{latest_owner}' can initiate a transfer"}), 403
-        if sender_role not in ["Distributor"]:
-            return jsonify({"error": "Only Distributors can transfer after Farmers"}), 403
+        last_tx = history[-1]
+        # Determine latest owner email
+        if "action" in last_tx and last_tx.get("action") == "ownership_accepted":
+            latest_owner_email = last_tx.get("to_email")
+        elif "from_email" in last_tx:
+            latest_owner_email = last_tx.get("from_email")
+        elif "owner_email" in last_tx:
+            latest_owner_email = last_tx.get("owner_email")
+        else:
+            print("[DEBUG] Invalid transaction format in blockchain")
+            return jsonify({"error": "Invalid transaction format in blockchain"}), 500
 
-    # Create transfer request
+        print(f"[DEBUG] Latest owner email: {latest_owner_email}")
+
+        if latest_owner_email != sender_email:
+            print("[DEBUG] Sender is not the current owner of this batch")
+            return jsonify({"error": "You are not the current owner of this batch"}), 403
+
+    # Create transfer request using email identifiers
     tx = blockchain.create_transfer_request(
         batch_id=data["batch_id"],
-        sender=data["from"],
-        receiver=data["to"]
+        sender_email=data["from_email"],
+        receiver_email=data["to_email"]
     )
-    return jsonify({"message": "Transfer request created", "transaction": tx})
+
+    print("[DEBUG] Transfer request created successfully")
+    return jsonify({"message": "Transfer request created", "transaction": tx}), 201
+
 
 
 
@@ -317,67 +359,72 @@ def transfer_request():
 @jwt_required()
 def accept_transfer():
     data = request.get_json()
-    required = ["batch_id", "receiver", "conditions"]
+    required = ["batch_id", "receiver_email", "conditions"]
     for field in required:
         if field not in data:
             return jsonify({"error": f"Missing field: {field}"}), 400
 
+    # Get logged-in user info
     claims = get_jwt()
     receiver_role = claims["role"]
-    receiver_email = get_jwt_identity()
+    logged_in_email = get_jwt_identity()
 
-    if data["receiver"] != receiver_email:
-        return jsonify({"error": "You are not the intended receiver for this transfer"}), 403
+    # Compare receiver email directly
+    if data["receiver_email"] != logged_in_email:
+        return jsonify({"error": f"You are not the intended receiver for this transfer"}), 403
 
-    # Allow both Distributors and Retailers to accept
-    if receiver_role not in ["Distributor", "Retailer"]:
+    # Allow only Distributor or Retailer to accept
+    if receiver_role.lower() not in ["distributor", "retailer"]:
         return jsonify({"error": f"{receiver_role}s are not allowed to accept ownership"}), 403
 
+    # Proceed with accepting transfer
     tx = blockchain.accept_transfer(
         batch_id=data["batch_id"],
-        receiver=data["receiver"],
+        receiver_email=logged_in_email,
         conditions=data["conditions"]
     )
+
     if tx:
         return jsonify({"message": "Transfer accepted", "transaction": tx})
     return jsonify({"error": "No pending transfer found for this batch"}), 404
 
 
-@app.route("/reject_transfer", methods=["POST"])
-@jwt_required()
-def reject_transfer():
-    data = request.get_json()
-    batch_id = data.get("batch_id")
-    receiver = get_jwt_identity()
 
-    pending = PendingTransferModel.query.filter_by(
-        batch_id=batch_id, receiver=receiver, status="pending"
-    ).first()
-    if not pending:
-        return jsonify({"error": "No pending transfer found"}), 404
-
-    # Mark as rejected
-    pending.status = "rejected"
-    db.session.commit()
-
-    # Update batch status
-    batch = BatchModel.query.filter_by(batch_id=batch_id).first()
-    if batch:
-        batch.status = "Rejected"
-        db.session.commit()
-
-    # Log rejection on blockchain too
-    tx = {
-        "batch_id": batch_id,
-        "from": pending.sender,
-        "to": receiver,
-        "action": "transfer_rejected",
-        "timestamp": time.time(),
-        "status": "rejected"
-    }
-    blockchain.add_block(tx)
-
-    return jsonify({"message": "Transfer rejected", "transaction": tx})
+# @app.route("/reject_transfer", methods=["POST"])
+# @jwt_required()
+# def reject_transfer():
+#     data = request.get_json()
+#     batch_id = data.get("batch_id")
+#     receiver = get_jwt_identity()
+#
+#     pending = PendingTransferModel.query.filter_by(
+#         batch_id=batch_id, receiver=receiver, status="pending"
+#     ).first()
+#     if not pending:
+#         return jsonify({"error": "No pending transfer found"}), 404
+#
+#     # Mark as rejected
+#     pending.status = "rejected"
+#     db.session.commit()
+#
+#     # Update batch status
+#     batch = BatchModel.query.filter_by(batch_id=batch_id).first()
+#     if batch:
+#         batch.status = "Rejected"
+#         db.session.commit()
+#
+#     # Log rejection on blockchain too
+#     tx = {
+#         "batch_id": batch_id,
+#         "from": pending.sender,
+#         "to": receiver,
+#         "action": "transfer_rejected",
+#         "timestamp": time.time(),
+#         "status": "rejected"
+#     }
+#     blockchain.add_block(tx)
+#
+#     return jsonify({"message": "Transfer rejected", "transaction": tx})
 
 
 @app.route("/dashboard_stats", methods=["GET"])
@@ -409,7 +456,7 @@ def my_transactions():
 
     user_name = user.name
 
-    transactions = TransactionModel.query.filter_by(owner=user_name).all()
+    transactions = TransactionModel.query.filter_by(owner=user_name).order_by(TransactionModel.timestamp.desc()).all()
 
     if not transactions:
         return jsonify({"transactions": []})
@@ -423,7 +470,7 @@ def my_transactions():
         result.append({
             "batch_id": tx.batch_id,
             "product": tx.product,
-            "to": tx.owner,  # current owner (name)
+            "to": tx.owner,
             "date": tx.timestamp,
             "status": status
         })
@@ -455,6 +502,46 @@ def batch_history(batch_id):
     if not history:
         return jsonify({"message": f"No transactions found for batch_id {batch_id}"}), 404
     return jsonify({"batch_id": batch_id, "history": history})
+
+@app.route("/my_transaction_count", methods=["GET"])
+@jwt_required()
+def my_transaction_count():
+    user_email = get_jwt_identity()
+    user = User.query.filter_by(email=user_email).first()
+    if not user:
+        return jsonify({"count": 0})
+
+    count = TransactionModel.query.filter_by(owner=user.name).count()
+    return jsonify({"count": count})
+
+
+@app.route("/my_pending_count", methods=["GET"])
+@jwt_required()
+def my_pending_count():
+    user_email = get_jwt_identity()
+    user = User.query.filter_by(email=user_email).first()
+    if not user:
+        return jsonify({"count": 0})
+
+    count = PendingTransferModel.query.filter_by(sender_email=user_email).count()
+    return jsonify({"count": count})
+
+@app.route("/get_users", methods=["GET"])
+def get_users():
+    users = User.query.all()
+    user_list = []
+
+    for user in users:
+        # Convert SQLAlchemy object to dict and remove internal attributes
+        user_data = {
+            "id": user.id,
+            "name": user.name,
+            "role": user.role,
+            "email": user.email
+        }
+        user_list.append(user_data)
+
+    return jsonify(user_list)
 
 
 # Main Entry

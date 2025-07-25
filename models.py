@@ -32,8 +32,8 @@ class BlockModel(db.Model):
 class PendingTransferModel(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     batch_id = db.Column(db.String(100), nullable=False, index=True)
-    sender = db.Column(db.String(100), nullable=False)
-    receiver = db.Column(db.String(100), nullable=False)
+    sender_email = db.Column(db.String(100), nullable=False)
+    receiver_email = db.Column(db.String(100), nullable=False)
     timestamp = db.Column(db.Float, nullable=False)
     status = db.Column(db.String(50), default="pending")
     conditions = db.Column(db.Text)

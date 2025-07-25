@@ -1,5 +1,5 @@
 import hashlib, json, time
-from models import db, BlockModel, PendingTransferModel, BatchModel
+from models import db, BlockModel, PendingTransferModel, BatchModel, User
 from dataclasses import dataclass, field
 
 @dataclass(frozen=True)
@@ -100,41 +100,49 @@ class Blockchain:
                 return False
         return True
 
-    def create_transfer_request(self, batch_id, sender, receiver):
+    def create_transfer_request(self, batch_id, sender_email, receiver_email):
         tx = {
             "batch_id": batch_id,
-            "from": sender,
-            "to": receiver,
+            "from_email": sender_email,
+            "to_email": receiver_email,
             "action": "transfer_request",
             "status": "pending",
             "timestamp": time.time()
         }
-        # Save to DB instead of just in memory
+
+        # Save to DB (Pending Transfer)
         pending = PendingTransferModel(
             batch_id=batch_id,
-            sender=sender,
-            receiver=receiver,
-            timestamp=tx["timestamp"]
+            sender_email=sender_email,
+            receiver_email=receiver_email,
+            timestamp=tx["timestamp"],
+            status="pending"
         )
         db.session.add(pending)
         db.session.commit()
         return tx
 
-    def accept_transfer(self, batch_id, receiver, conditions):
-        pending = PendingTransferModel.query.filter_by(batch_id=batch_id, receiver=receiver, status="pending").first()
+    def accept_transfer(self, batch_id, receiver_email, conditions):
+        pending = PendingTransferModel.query.filter_by(
+            batch_id=batch_id,
+            receiver_email=receiver_email,
+            status="pending"
+        ).first()
+
         if not pending:
             return None
 
         tx = {
             "batch_id": batch_id,
-            "from": pending.sender,
-            "to": pending.receiver,
+            "from_email": pending.sender_email,
+            "to_email": pending.receiver_email,
             "action": "ownership_accepted",
             "conditions": conditions,
             "timestamp": time.time(),
             "status": "accepted"
         }
-        # Add as blockchain block
+
+        # Add to blockchain
         self.add_block(tx)
 
         # Update DB record
@@ -142,13 +150,14 @@ class Blockchain:
         pending.conditions = json.dumps(conditions)
         db.session.commit()
 
+        # Update current owner in BatchModel
         batch = BatchModel.query.filter_by(batch_id=batch_id).first()
         if batch:
-            batch.current_owner = receiver
+            batch.current_owner_email = receiver_email
 
-            # If receiver is Distributor → still In Transit
-            # If receiver is Retailer → Delivered (Done)
-            if "Retailer" in receiver:
+            # If receiver is Retailer → Delivered (Done), else In Transit
+            user = User.query.filter_by(email=receiver_email).first()
+            if user and user.role.lower() == "retailer":
                 batch.status = "Delivered"
             else:
                 batch.status = "In Transit"
