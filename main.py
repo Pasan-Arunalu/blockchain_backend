@@ -76,7 +76,8 @@ def get_chain():
 @jwt_required()
 def add_transaction():
     tx_data = request.get_json()
-    required_fields = ["batch_id", "product", "owner", "location", "temperature", "humidity", "transport"]
+    print("Incoming transaction data:", tx_data)
+    required_fields = ["batch_id", "product", "owner_email", "location", "temperature", "humidity", "transport"]
 
     # Verify all fields
     for field in required_fields:
@@ -102,6 +103,7 @@ def add_transaction():
 
     # Save transaction
     tx_data['timestamp'] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    tx_data['owner'] = tx_data.pop('owner_email')
     blockchain.add_block(tx_data)
     new_tx = TransactionModel(**tx_data)
     db.session.add(new_tx)
@@ -332,6 +334,8 @@ def transfer_request():
             latest_owner_email = last_tx.get("from_email")
         elif "owner_email" in last_tx:
             latest_owner_email = last_tx.get("owner_email")
+        elif "owner" in last_tx:
+            latest_owner_email = last_tx.get("owner")
         else:
             print("[DEBUG] Invalid transaction format in blockchain")
             return jsonify({"error": "Invalid transaction format in blockchain"}), 500
@@ -351,8 +355,6 @@ def transfer_request():
 
     print("[DEBUG] Transfer request created successfully")
     return jsonify({"message": "Transfer request created", "transaction": tx}), 201
-
-
 
 
 @app.route("/accept_transfer", methods=["POST"])
@@ -454,9 +456,7 @@ def my_transactions():
     if not user:
         return jsonify({"error": "User not found"}), 404
 
-    user_name = user.name
-
-    transactions = TransactionModel.query.filter_by(owner=user_name).order_by(TransactionModel.timestamp.desc()).all()
+    transactions = TransactionModel.query.filter_by(owner=user_email).order_by(TransactionModel.timestamp.desc()).all()
 
     if not transactions:
         return jsonify({"transactions": []})

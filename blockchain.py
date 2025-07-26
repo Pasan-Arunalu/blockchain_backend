@@ -20,7 +20,7 @@ class Block:
         return hashlib.sha256(block_string.encode()).hexdigest()
 
     def __post_init__(self):
-        # ✅ If hash is missing, compute automatically
+        # If hash is missing, compute automatically
         if not self.hash:
             object.__setattr__(self, "hash", self.calculate_hash())
 
@@ -44,7 +44,7 @@ class Blockchain:
         return Block(
             index=0,
             timestamp=time.time(),
-            transactions={"message": "Genesis Block"},
+            transactions=[{"message": "Genesis Block"}],
             previous_hash="0",
             hash=""
         )
@@ -85,7 +85,7 @@ class Blockchain:
                 Block(
                     index=b.index,
                     timestamp=float(b.timestamp),
-                    transactions=json.loads(b.transactions) if b.transactions else {},
+                    transactions=json.loads(b.transactions) if b.transactions else [],
                     previous_hash=b.previous_hash,
                     hash=b.hash
                 )
@@ -99,6 +99,27 @@ class Blockchain:
             if current.hash != current.calculate_hash() or current.previous_hash != previous.hash:
                 return False
         return True
+
+    def create_initial_batch(self, batch_id, owner_email, details=None):
+        tx = {
+            "batch_id": batch_id,
+            "owner_email": owner_email,
+            "action": "batch_created",
+            "details": details or {},
+            "timestamp": time.time()
+        }
+        self.add_block(tx)
+
+        # Save in DB
+        batch = BatchModel(
+            batch_id=batch_id,
+            current_owner_email=owner_email,
+            status="Created"
+        )
+        db.session.add(batch)
+        db.session.commit()
+
+        return tx
 
     def create_transfer_request(self, batch_id, sender_email, receiver_email):
         tx = {
@@ -136,6 +157,7 @@ class Blockchain:
             "batch_id": batch_id,
             "from_email": pending.sender_email,
             "to_email": pending.receiver_email,
+            "owner_email": pending.receiver_email,
             "action": "ownership_accepted",
             "conditions": conditions,
             "timestamp": time.time(),
@@ -166,8 +188,13 @@ class Blockchain:
         return tx
 
     def log_conditions(self, batch_id, conditions):
+        batch = BatchModel.query.filter_by(batch_id=batch_id).first()
+        if not batch:
+            return None
+
         tx = {
             "batch_id": batch_id,
+            "owner_email": batch.current_owner_email,
             "action": "update_conditions",
             "conditions": conditions,
             "timestamp": time.time()
