@@ -101,18 +101,26 @@ class Blockchain:
         return True
 
     def create_initial_batch(self, batch_id, owner_email, details=None):
+        # Ensure details is always a dict
+        details = details or {}
+
+        # Extract product_name
+        product_name = details.get("product") or "Unknown Product"
+
+        # Add a blockchain transaction
         tx = {
             "batch_id": batch_id,
             "owner_email": owner_email,
             "action": "batch_created",
-            "details": details or {},
+            "details": details,
             "timestamp": time.time()
         }
         self.add_block(tx)
 
-        # Save in DB
+        # Save in DB → include product_name
         batch = BatchModel(
             batch_id=batch_id,
+            product_name=product_name,
             current_owner_email=owner_email,
             status="Created"
         )
@@ -179,12 +187,13 @@ class Blockchain:
 
             # If receiver is Retailer → Delivered (Done), else In Transit
             user = User.query.filter_by(email=receiver_email).first()
-            if user and user.role.lower() == "retailer":
+            if user and user.role.lower() == "distributor" or user and user.role.lower() == "retailer":
                 batch.status = "Delivered"
             else:
                 batch.status = "In Transit"
             db.session.commit()
 
+        tx["owner"] = tx["owner_email"]
         return tx
 
     def log_conditions(self, batch_id, conditions):

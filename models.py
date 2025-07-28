@@ -42,7 +42,7 @@ class BatchModel(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     batch_id = db.Column(db.String(100), unique=True, nullable=False)
     product_name = db.Column(db.String(200), nullable=False)
-    current_owner = db.Column(db.String(200), nullable=False)
+    current_owner_email = db.Column(db.String(200), nullable=False)
     status = db.Column(db.String(50), default="Created")  # Created, In Transit, Delivered, Rejected
     created_at = db.Column(db.Float, default=lambda: time.time())
     updated_at = db.Column(db.Float, default=time.time, onupdate=time.time)
