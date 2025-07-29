@@ -369,6 +369,7 @@ def my_pending_requests():
     result = []
     for req in requests:
         result.append({
+            "transfer_id": req.id,
             "batch_id": req.batch_id,
             "from": req.sender_email,
             "to": req.receiver_email,
@@ -379,82 +380,75 @@ def my_pending_requests():
     return jsonify({"pending_requests": result})
 
 
-@app.route("/accept_transfer", methods=["POST"])
+@app.route("/accept_transfer/<int:transfer_id>", methods=["POST"])
 @jwt_required()
-def accept_transfer():
-    data = request.get_json()
-    required = ["batch_id", "receiver_email", "conditions"]
-    for field in required:
-        if field not in data:
-            return jsonify({"error": f"Missing field: {field}"}), 400
+def accept_transfer(transfer_id):
+    owner_email = get_jwt_identity()
+    pending_transfer = PendingTransferModel.query.get(transfer_id)
 
-    # Get logged-in user info
-    claims = get_jwt()
-    receiver_role = claims["role"]
-    logged_in_email = get_jwt_identity()
+    if not pending_transfer:
+        return jsonify({"error": "Transfer not found"}), 404
 
-    if data["receiver_email"] != logged_in_email:
-        return jsonify({"error": "You are not the intended receiver for this transfer"}), 403
+    if pending_transfer.receiver_email != owner_email:
+        return jsonify({"error": "Not authorized"}), 403
 
-    if receiver_role.lower() not in ["distributor", "retailer"]:
-        return jsonify({"error": f"{receiver_role}s are not allowed to accept ownership"}), 403
+    # Get the JSON data from the POST request body
+    req_data = request.get_json()
 
-    # Accept in blockchain
-    tx = blockchain.accept_transfer(
-        batch_id=data["batch_id"],
-        receiver_email=logged_in_email,
-        conditions=data["conditions"]
+    if not req_data:
+        return jsonify({"error": "Missing data"}), 400
+
+    # Use batch_id from URL param or request data
+    batch_id = pending_transfer.batch_id
+    # Prepare transaction data for new block
+    data = {
+        "batch_id": batch_id,
+        "owner": owner_email,
+        "conditions": req_data.get("conditions", {}),
+        # Add other needed fields here if applicable
+    }
+
+    batch = BatchModel.query.filter_by(batch_id=batch_id).first()
+    if not batch:
+        return jsonify({"error": "Batch not found"}), 404
+
+    if batch.status == "Distributed":
+        return jsonify({"error": "Blockchain is closed for this product"}), 400
+
+    blockchain = Blockchain()
+    blockchain.load_chain_from_db()
+
+    # Add block to blockchain
+    previous_hash = blockchain.get_latest_block().hash
+    blockchain.add_block(data)
+
+    # Update batch owner and status
+    batch.current_owner_email = owner_email
+    receiver_user = User.query.filter_by(email=owner_email).first()
+    if receiver_user.role == "distributor":
+        batch.status = "In Distribution"
+    elif receiver_user.role == "retailer":
+        batch.status = "Distributed"
+        batch.blockchain_closed = True
+
+    new_tx = TransactionModel(
+        batch_id=batch_id,
+        product=batch.product_name,
+        owner=owner_email,
+        location=req_data.get("location", "Unknown"),
+        temperature=req_data.get("temperature", "N/A"),
+        humidity=req_data.get("humidity", "N/A"),
+        transport=req_data.get("transport", "N/A"),
+        timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     )
+    db.session.add(new_tx)
 
-    if tx:
-        try:
-            # Extract conditions safely
-            conditions = data["conditions"]
-            location = conditions.get("location", "Unknown")
-            temperature = str(conditions.get("temperature", ""))
-            humidity = str(conditions.get("humidity", ""))
-            transport = conditions.get("transport", "")
+    # Remove pending transfer
+    db.session.delete(pending_transfer)
+    db.session.commit()
 
-            # Get product name from batch (optional)
-            batch = BatchModel.query.filter_by(batch_id=tx["batch_id"]).first()
-            product_name = batch.product_name if batch else "N/A"
+    return jsonify({"message": "Transfer accepted and added to blockchain"}), 200
 
-            # 1. Save to TransactionModel
-            new_tx = TransactionModel(
-                batch_id=tx["batch_id"],
-                product=product_name,
-                owner=tx["owner_email"],
-                location=location,
-                temperature=temperature,
-                humidity=humidity,
-                transport=transport,
-                timestamp=str(tx["timestamp"])
-            )
-            db.session.add(new_tx)
-
-            # 2. Update PendingTransferModel
-            pending = PendingTransferModel.query.filter_by(batch_id=tx["batch_id"], status="pending").first()
-            if pending:
-                pending.status = "accepted"
-
-            # 3. Update BatchModel current owner
-            if batch:
-                batch.current_owner_email = logged_in_email
-                batch.status = "Delivered" if receiver_role.lower() == "retailer" else "In Transit"
-
-            db.session.commit()
-
-            return jsonify({"message": "Transfer accepted and recorded", "transaction": tx})
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            db.session.rollback()
-            return jsonify({
-                "error": "Transfer accepted but DB failed",
-                "details": str(e)
-            }), 500
-
-    return jsonify({"error": "No pending transfer found for this batch"}), 404
 
 
 # @app.route("/reject_transfer", methods=["POST"])
