@@ -4,9 +4,11 @@ from flask_cors import CORS
 from flask import Flask, jsonify, request, Response
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity, get_jwt
 from werkzeug.security import generate_password_hash, check_password_hash
-from sqlalchemy import or_
 
-import datetime, json, plotly.graph_objs as go, plotly
+import datetime, json, matplotlib.pyplot as plt, matplotlib
+import matplotlib.dates as mdates
+import io
+import base64
 import time
 
 from models import db, TransactionModel, User, BlockModel, PendingTransferModel, BatchModel
@@ -35,8 +37,10 @@ with app.app_context():
 
 @app.after_request
 def after_request(response):
+    response.headers.add("Access-Control-Allow-Origin", "http://localhost:5173")
     response.headers.add("Access-Control-Allow-Headers", "Content-Type,Authorization")
     response.headers.add("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
+    response.headers.add("Access-Control-Allow-Credentials", "true")
     return response
 
 
@@ -58,6 +62,17 @@ def role_required(allowed_roles):
 def home():
     return "Welcome to the Food Supply Chain Blockchain API!"
 
+@app.route('/', methods=['OPTIONS'])
+@app.route('/<path:path>', methods=['OPTIONS'])
+def handle_options(path=None):
+    """Handle CORS preflight requests"""
+    response = jsonify({"message": "OK"})
+    response.headers.add("Access-Control-Allow-Origin", "http://localhost:5173")
+    response.headers.add("Access-Control-Allow-Headers", "Content-Type,Authorization")
+    response.headers.add("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
+    response.headers.add("Access-Control-Allow-Credentials", "true")
+    return response
+
 @app.route('/chain', methods=['GET'])
 def get_chain():
     """Return the full blockchain"""
@@ -75,53 +90,84 @@ def get_chain():
 @app.route('/add_transaction', methods=['POST'])
 @jwt_required()
 def add_transaction():
-    tx_data = request.get_json()
-    print("Incoming transaction data:", tx_data)
-    required_fields = ["batch_id", "product", "owner_email", "location", "temperature", "humidity", "transport"]
+    try:
+        tx_data = request.get_json()
+        print("Incoming transaction data:", tx_data)
+        
+        if not tx_data:
+            return jsonify({"error": "No JSON data provided"}), 400
+            
+        required_fields = ["batch_id", "product", "owner_email", "location", "temperature", "humidity", "transport"]
 
-    # Verify all fields
-    for field in required_fields:
-        if field not in tx_data:
-            return "Missing field: " + field, 400
+        # Verify all fields
+        for field in required_fields:
+            if field not in tx_data:
+                return jsonify({"error": f"Missing field: {field}"}), 400
 
-    # Get user info from JWT
-    email = get_jwt_identity()        # only email
-    claims = get_jwt()                # contains role
-    role = claims.get("role")         # SAFE way to get role
+        # Get user info from JWT
+        email = get_jwt_identity()        # only email
+        claims = get_jwt()                # contains role
+        role = claims.get("role")         # SAFE way to get role
+        
+        print(f"User email: {email}, role: {role}")
 
-    # Business logic for role control
-    existing_batch = TransactionModel.query.filter_by(batch_id=tx_data['batch_id']).first()
+        # Business logic for role control
+        existing_transaction = TransactionModel.query.filter_by(batch_id=tx_data['batch_id']).first()
+        existing_batch = BatchModel.query.filter_by(batch_id=tx_data['batch_id']).first()
 
-    if not existing_batch:
-        # No batch yet → must be created by Farmer
-        if role.lower() != "farmer":
-            return jsonify({"error": f"Only Farmers can create new batch, but you are {role}"}), 403
+        if not existing_transaction and not existing_batch:
+            # No batch exists anywhere → must be created by Farmer
+            if role.lower() != "farmer":
+                return jsonify({"error": f"Only Farmers can create new batch, but you are {role}"}), 403
 
-        # Call create_initial_batch instead of manually creating a block
-        blockchain.create_initial_batch(
-            batch_id=tx_data['batch_id'],
-            owner_email=email,
-            details={
-                "product": tx_data["product"],
-                "location": tx_data["location"],
-                "temperature": tx_data["temperature"],
-                "humidity": tx_data["humidity"],
-                "transport": tx_data["transport"]
-            }
-        )
-    else:
-        # Already exists → must be Distributor or Retailer
-        if role.lower() not in ["distributor", "retailer"]:
-            return jsonify({"error": f"Only Distributor/Retailer can transfer ownership, but you are {role}"}), 403
+            print(f"Creating initial batch: {tx_data['batch_id']}")
+            # Call create_initial_batch instead of manually creating a block
+            blockchain.create_initial_batch(
+                batch_id=tx_data['batch_id'],
+                owner_email=email,
+                details={
+                    "product": tx_data["product"],
+                    "location": tx_data["location"],
+                    "temperature": tx_data["temperature"],
+                    "humidity": tx_data["humidity"],
+                    "transport": tx_data["transport"]
+                }
+            )
+        elif existing_batch:
+            # Batch exists in BatchModel → check if user is the current owner
+            if existing_batch.current_owner_email != email:
+                return jsonify({"error": f"You are not the current owner of this batch. Current owner: {existing_batch.current_owner_email}"}), 403
+        else:
+            # Batch exists in TransactionModel but not BatchModel (inconsistent state)
+            print(f"Warning: Batch {tx_data['batch_id']} exists in TransactionModel but not BatchModel")
+            # Continue with the transaction creation
 
-    # Save transaction
-    tx_data['timestamp'] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    tx_data['owner'] = tx_data.pop('owner_email')
-    new_tx = TransactionModel(**tx_data)
-    db.session.add(new_tx)
-    db.session.commit()
+        # Save transaction with current user as owner
+        tx_data['timestamp'] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        tx_data['owner'] = email  # Set owner to current user
+        
+        # Remove owner_email field as TransactionModel doesn't have it
+        if 'owner_email' in tx_data:
+            del tx_data['owner_email']
+        
+        print(f"Creating transaction with data: {tx_data}")
+        new_tx = TransactionModel(**tx_data)
+        db.session.add(new_tx)
+        db.session.commit()
+        
+        print("Transaction saved successfully")
 
-    return jsonify({"message": "Transaction added successfully!", "role": role})
+        return jsonify({
+            "message": "Transaction added successfully!", 
+            "role": role,
+            "batch_id": tx_data['batch_id'],
+            "is_new_batch": not existing_transaction and not existing_batch
+        })
+        
+    except Exception as e:
+        print(f"Error in add_transaction: {str(e)}")
+        db.session.rollback()
+        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
 
 
 @app.route('/db_transactions/<batch_id>', methods=['GET'])
@@ -130,18 +176,27 @@ def db_transactions(batch_id):
     if not txs:
         return jsonify({"message": "No transactions in DB for this batch"}), 404
 
+    # Get current batch owner
+    batch = BatchModel.query.filter_by(batch_id=batch_id).first()
+    current_owner = batch.current_owner_email if batch else None
+
     data = []
     for t in txs:
+        # Check if this transaction shows ownership transfer
+        is_transfer = t.owner != current_owner if current_owner else False
+        
         data.append({
             "product": t.product,
             "owner": t.owner,
+            "current_owner": current_owner,
             "location": t.location,
             "temperature": t.temperature,
             "humidity": t.humidity,
             "transport": t.transport,
-            "timestamp": t.timestamp
+            "timestamp": t.timestamp,
+            "is_transfer": is_transfer
         })
-    return jsonify({"batch_id": batch_id, "transactions": data})
+    return jsonify({"batch_id": batch_id, "transactions": data, "current_owner": current_owner})
 
 
 @app.route('/product/<batch_id>', methods=['GET'])
@@ -180,64 +235,327 @@ def debug_chain():
 
 # Visualization Routes
 @app.route('/visualize/<batch_id>', methods=['GET'])
+@jwt_required()
 def visualize_batch(batch_id):
-    """Return Plotly JSON for temperature & humidity trend"""
+    """Return matplotlib chart as base64 encoded image"""
+    user_email = get_jwt_identity()
+    
+    # Check if user has access to this batch
+    batch = BatchModel.query.filter_by(batch_id=batch_id).first()
+    if not batch:
+        return jsonify({"error": "Batch not found"}), 404
+    
+    # Only allow access if user is the current owner or has transactions for this batch
+    if batch.current_owner_email != user_email:
+        # Check if user has any transactions for this batch
+        user_transaction = TransactionModel.query.filter_by(
+            batch_id=batch_id, 
+            owner=user_email
+        ).first()
+        if not user_transaction:
+            return jsonify({"error": "Access denied. You don't have permission to view this batch data"}), 403
+    
+    # Get temperature and humidity data from database transactions
+    transactions = TransactionModel.query.filter_by(batch_id=batch_id).order_by(TransactionModel.timestamp).all()
+    
     times, temps, humids = [], [], []
-
-    for block in blockchain.chain:
-        tx = block.transactions
-        if isinstance(tx, dict) and tx.get('batch_id') == batch_id:
-            try:
-                times.append(datetime.datetime.strptime(tx['timestamp'], "%Y-%m-%d %H:%M:%S"))
-                temps.append(int(tx['temperature'].replace('°C','')))
-                humids.append(int(tx['humidity'].replace('%','')))
-            except:
-                continue
+    
+    for tx in transactions:
+        try:
+            # Parse timestamp
+            timestamp = datetime.datetime.strptime(tx.timestamp, "%Y-%m-%d %H:%M:%S")
+            times.append(timestamp)
+            
+            # Parse temperature (remove °C and convert to int)
+            if tx.temperature and tx.temperature != "N/A":
+                temp_value = int(tx.temperature.replace('°C', '').strip())
+                temps.append(temp_value)
+            else:
+                temps.append(None)
+            
+            # Parse humidity (remove % and convert to int)
+            if tx.humidity and tx.humidity != "N/A":
+                humid_value = int(tx.humidity.replace('%', '').strip())
+                humids.append(humid_value)
+            else:
+                humids.append(None)
+                
+        except (ValueError, AttributeError) as e:
+            print(f"Error parsing transaction data: {e}")
+            continue
 
     if not times:
-        return jsonify({"message": f"No data to visualize for batch_id {batch_id}"}), 404
+        return jsonify({"message": f"No temperature/humidity data found for batch_id {batch_id}"}), 404
 
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=times, y=temps, mode='lines+markers', name='Temperature (°C)'))
-    fig.add_trace(go.Scatter(x=times, y=humids, mode='lines+markers', name='Humidity (%)'))
-
-    fig.update_layout(title=f"Temperature & Humidity Over Time for {batch_id}",
-                      xaxis_title="Timestamp",
-                      yaxis_title="Value",
-                      legend_title="Metrics")
-
-    graphJSON = json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
-    return Response(graphJSON, mimetype='application/json')
+    # Create matplotlib figure
+    plt.figure(figsize=(12, 6))
+    
+    # Plot temperature data
+    valid_temp_data = [(t, temp) for t, temp in zip(times, temps) if temp is not None]
+    if valid_temp_data:
+        temp_times, temp_values = zip(*valid_temp_data)
+        plt.plot(temp_times, temp_values, 'r-o', label='Temperature (°C)', linewidth=2, markersize=6)
+    
+    # Plot humidity data
+    valid_humid_data = [(t, humid) for t, humid in zip(times, humids) if humid is not None]
+    if valid_humid_data:
+        humid_times, humid_values = zip(*valid_humid_data)
+        plt.plot(humid_times, humid_values, 'b-s', label='Humidity (%)', linewidth=2, markersize=6)
+    
+    # Customize the plot
+    plt.title(f'Temperature & Humidity Over Time for {batch_id}', fontsize=14, fontweight='bold')
+    plt.xlabel('Timestamp', fontsize=12)
+    plt.ylabel('Value', fontsize=12)
+    plt.legend(fontsize=10)
+    plt.grid(True, alpha=0.3)
+    
+    # Format x-axis dates
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
+    plt.gca().xaxis.set_major_locator(mdates.AutoDateLocator())
+    plt.gcf().autofmt_xdate()  # Rotate and align the tick labels
+    
+    # Adjust layout
+    plt.tight_layout()
+    
+    # Save to bytes buffer
+    img_buffer = io.BytesIO()
+    plt.savefig(img_buffer, format='png', dpi=100, bbox_inches='tight')
+    img_buffer.seek(0)
+    
+    # Encode to base64
+    img_base64 = base64.b64encode(img_buffer.getvalue()).decode()
+    
+    # Close the plot to free memory
+    plt.close()
+    
+    return jsonify({
+        "image": img_base64,
+        "format": "png",
+        "batch_id": batch_id,
+        "data_points": len(times)
+    })
 
 @app.route('/visualize_html/<batch_id>', methods=['GET'])
+@jwt_required()
 def visualize_batch_html(batch_id):
-    """Render an interactive HTML chart for a batch"""
-    import plotly.offline as pyo
+    """Render matplotlib chart as HTML with embedded image"""
+    user_email = get_jwt_identity()
+    
+    # Check if user has access to this batch
+    batch = BatchModel.query.filter_by(batch_id=batch_id).first()
+    if not batch:
+        return jsonify({"error": "Batch not found"}), 404
+    
+    # Only allow access if user is the current owner or has transactions for this batch
+    if batch.current_owner_email != user_email:
+        # Check if user has any transactions for this batch
+        user_transaction = TransactionModel.query.filter_by(
+            batch_id=batch_id, 
+            owner=user_email
+        ).first()
+        if not user_transaction:
+            return jsonify({"error": "Access denied. You don't have permission to view this batch data"}), 403
 
+    # Get temperature and humidity data from database transactions
+    transactions = TransactionModel.query.filter_by(batch_id=batch_id).order_by(TransactionModel.timestamp).all()
+    
     times, temps, humids = [], [], []
-    for block in blockchain.chain:
-        tx = block.transactions
-        if isinstance(tx, dict) and tx.get('batch_id') == batch_id:
-            try:
-                times.append(datetime.datetime.strptime(tx['timestamp'], "%Y-%m-%d %H:%M:%S"))
-                temps.append(int(tx['temperature'].replace('°C','')))
-                humids.append(int(tx['humidity'].replace('%','')))
-            except:
-                continue
+    
+    for tx in transactions:
+        try:
+            # Parse timestamp
+            timestamp = datetime.datetime.strptime(tx.timestamp, "%Y-%m-%d %H:%M:%S")
+            times.append(timestamp)
+            
+            # Parse temperature (remove °C and convert to int)
+            if tx.temperature and tx.temperature != "N/A":
+                temp_value = int(tx.temperature.replace('°C', '').strip())
+                temps.append(temp_value)
+            else:
+                temps.append(None)
+            
+            # Parse humidity (remove % and convert to int)
+            if tx.humidity and tx.humidity != "N/A":
+                humid_value = int(tx.humidity.replace('%', '').strip())
+                humids.append(humid_value)
+            else:
+                humids.append(None)
+                
+        except (ValueError, AttributeError) as e:
+            print(f"Error parsing transaction data: {e}")
+            continue
 
     if not times:
-        return "No data to visualize", 404
+        return jsonify({"error": f"No temperature/humidity data found for batch_id {batch_id}"}), 404
 
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=times, y=temps, mode='lines+markers', name='Temperature (°C)'))
-    fig.add_trace(go.Scatter(x=times, y=humids, mode='lines+markers', name='Humidity (%)'))
+    # Create matplotlib figure
+    plt.figure(figsize=(12, 6))
+    
+    # Plot temperature data
+    valid_temp_data = [(t, temp) for t, temp in zip(times, temps) if temp is not None]
+    if valid_temp_data:
+        temp_times, temp_values = zip(*valid_temp_data)
+        plt.plot(temp_times, temp_values, 'r-o', label='Temperature (°C)', linewidth=2, markersize=6)
+    
+    # Plot humidity data
+    valid_humid_data = [(t, humid) for t, humid in zip(times, humids) if humid is not None]
+    if valid_humid_data:
+        humid_times, humid_values = zip(*valid_humid_data)
+        plt.plot(humid_times, humid_values, 'b-s', label='Humidity (%)', linewidth=2, markersize=6)
+    
+    # Customize the plot
+    plt.title(f'Temperature & Humidity Over Time for {batch_id}', fontsize=14, fontweight='bold')
+    plt.xlabel('Timestamp', fontsize=12)
+    plt.ylabel('Value', fontsize=12)
+    plt.legend(fontsize=10)
+    plt.grid(True, alpha=0.3)
+    
+    # Format x-axis dates
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
+    plt.gca().xaxis.set_major_locator(mdates.AutoDateLocator())
+    plt.gcf().autofmt_xdate()  # Rotate and align the tick labels
+    
+    # Adjust layout
+    plt.tight_layout()
+    
+    # Save to bytes buffer
+    img_buffer = io.BytesIO()
+    plt.savefig(img_buffer, format='png', dpi=100, bbox_inches='tight')
+    img_buffer.seek(0)
+    
+    # Encode to base64
+    img_base64 = base64.b64encode(img_buffer.getvalue()).decode()
+    
+    # Close the plot to free memory
+    plt.close()
+    
+    # Create HTML with embedded image
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Temperature & Humidity Chart - {batch_id}</title>
+        <style>
+            body {{
+                font-family: Arial, sans-serif;
+                margin: 20px;
+                background-color: #f5f5f5;
+            }}
+            .container {{
+                max-width: 1200px;
+                margin: 0 auto;
+                background-color: white;
+                padding: 20px;
+                border-radius: 8px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            }}
+            h1 {{
+                color: #333;
+                text-align: center;
+                margin-bottom: 20px;
+            }}
+            .chart-container {{
+                text-align: center;
+                margin: 20px 0;
+            }}
+            img {{
+                max-width: 100%;
+                height: auto;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+            }}
+            .info {{
+                background-color: #f8f9fa;
+                padding: 15px;
+                border-radius: 4px;
+                margin-top: 20px;
+            }}
+            .info h3 {{
+                margin-top: 0;
+                color: #495057;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Temperature & Humidity Monitoring</h1>
+            <div class="chart-container">
+                <img src="data:image/png;base64,{img_base64}" alt="Temperature and Humidity Chart">
+            </div>
+            <div class="info">
+                <h3>Batch Information</h3>
+                <p><strong>Batch ID:</strong> {batch_id}</p>
+                <p><strong>Data Points:</strong> {len(times)}</p>
+                <p><strong>Latest Temperature:</strong> {temps[-1] if temps and temps[-1] is not None else 'N/A'}°C</p>
+                <p><strong>Latest Humidity:</strong> {humids[-1] if humids and humids[-1] is not None else 'N/A'}%</p>
+                <p><strong>Latest Timestamp:</strong> {times[-1].strftime('%Y-%m-%d %H:%M:%S') if times else 'N/A'}</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    
+    return html_content
 
-    fig.update_layout(title=f"Temp & Humidity Over Time for {batch_id}",
-                      xaxis_title="Timestamp",
-                      yaxis_title="Value",
-                      legend_title="Metrics")
 
-    return pyo.plot(fig, output_type='div')
+@app.route('/my_visualizations', methods=['GET'])
+@jwt_required()
+def my_visualizations():
+    """Get visualization data for all batches owned by the current user"""
+    user_email = get_jwt_identity()
+    
+    # Get all batches owned by the current user
+    owned_batches = BatchModel.query.filter_by(current_owner_email=user_email).all()
+    
+    if not owned_batches:
+        return jsonify({"message": "No batches found for visualization"}), 404
+    
+    result = []
+    for batch in owned_batches:
+        # Get transactions for this batch
+        transactions = TransactionModel.query.filter_by(batch_id=batch.batch_id).order_by(TransactionModel.timestamp).all()
+        
+        times, temps, humids = [], [], []
+        
+        for tx in transactions:
+            try:
+                # Parse timestamp
+                timestamp = datetime.datetime.strptime(tx.timestamp, "%Y-%m-%d %H:%M:%S")
+                times.append(timestamp)
+                
+                # Parse temperature
+                if tx.temperature and tx.temperature != "N/A":
+                    temp_value = int(tx.temperature.replace('°C', '').strip())
+                    temps.append(temp_value)
+                else:
+                    temps.append(None)
+                
+                # Parse humidity
+                if tx.humidity and tx.humidity != "N/A":
+                    humid_value = int(tx.humidity.replace('%', '').strip())
+                    humids.append(humid_value)
+                else:
+                    humids.append(None)
+                    
+            except (ValueError, AttributeError) as e:
+                print(f"Error parsing transaction data: {e}")
+                continue
+        
+        # Only include batches with valid data
+        if times:
+            result.append({
+                "batch_id": batch.batch_id,
+                "product_name": batch.product_name,
+                "status": batch.status,
+                "data_points": len(times),
+                "latest_temperature": temps[-1] if temps and temps[-1] is not None else None,
+                "latest_humidity": humids[-1] if humids and humids[-1] is not None else None,
+                "latest_timestamp": times[-1].strftime("%Y-%m-%d %H:%M:%S") if times else None,
+                "visualization_url": f"/visualize/{batch.batch_id}",
+                "html_visualization_url": f"/visualize_html/{batch.batch_id}"
+            })
+    
+    return jsonify({"batches": result})
 
 
 @app.route('/register', methods=['POST'])
@@ -246,10 +564,20 @@ def register():
     required = ["name", "role", "email", "password"]
     for f in required:
         if f not in data:
-            return f"Missing {f}", 400
+            return jsonify({"error": f"Missing field: {f}"}), 400
+
+    # Basic validation
+    if not data['email'] or '@' not in data['email']:
+        return jsonify({"error": "Invalid email format"}), 400
+    
+    if len(data['password']) < 6:
+        return jsonify({"error": "Password must be at least 6 characters"}), 400
+    
+    if data['role'].lower() not in ['farmer', 'distributor', 'retailer']:
+        return jsonify({"error": "Invalid role. Must be farmer, distributor, or retailer"}), 400
 
     if User.query.filter_by(email=data['email']).first():
-        return "Email already registered", 400
+        return jsonify({"error": "Email already registered"}), 400
 
     hashed_pw = generate_password_hash(data['password'], method='pbkdf2:sha256')
 
@@ -274,7 +602,7 @@ def login():
 
     user = User.query.filter_by(email=email).first()
     if not user or not check_password_hash(user.password, password):
-        return "Invalid credentials", 401
+        return jsonify({"error": "Invalid credentials"}), 401
 
     access_token = create_access_token(
         identity=user.email,
@@ -346,6 +674,7 @@ def transfer_request():
 
         print(f"[DEBUG] Latest owner email: {latest_owner_email}")
 
+        # Verify sender is the current owner
         if latest_owner_email != sender_email:
             print("[DEBUG] Sender is not the current owner of this batch")
             return jsonify({"error": "You are not the current owner of this batch"}), 403
@@ -368,28 +697,70 @@ def my_pending_requests():
 
     result = []
     for req in requests:
+        # Get sender user details
+        sender_user = User.query.filter_by(email=req.sender_email).first()
+        
+        # Get batch details
+        batch = BatchModel.query.filter_by(batch_id=req.batch_id).first()
+        
         result.append({
             "transfer_id": req.id,
             "batch_id": req.batch_id,
-            "from": req.sender_email,
-            "to": req.receiver_email,
+            "batch_product": batch.product_name if batch else "Unknown",
+            "batch_status": batch.status if batch else "Unknown",
+            "from_email": req.sender_email,
+            "from_name": sender_user.name if sender_user else "Unknown",
+            "from_role": sender_user.role if sender_user else "Unknown",
+            "to_email": req.receiver_email,
             "status": req.status,
-            "timestamp": req.timestamp
+            "timestamp": req.timestamp,
+            "accept_url": f"/accept_transfer/{req.id}"
         })
 
     return jsonify({"pending_requests": result})
 
 
+@app.route("/my_sent_transfers", methods=["GET"])
+@jwt_required()
+def my_sent_transfers():
+    """Get transfers sent by the current user"""
+    user_email = get_jwt_identity()
+    requests = PendingTransferModel.query.filter_by(sender_email=user_email).all()
+
+    result = []
+    for req in requests:
+        # Get receiver user details
+        receiver_user = User.query.filter_by(email=req.receiver_email).first()
+        
+        # Get batch details
+        batch = BatchModel.query.filter_by(batch_id=req.batch_id).first()
+        
+        result.append({
+            "transfer_id": req.id,
+            "batch_id": req.batch_id,
+            "batch_product": batch.product_name if batch else "Unknown",
+            "batch_status": batch.status if batch else "Unknown",
+            "to_email": req.receiver_email,
+            "to_name": receiver_user.name if receiver_user else "Unknown",
+            "to_role": receiver_user.role if receiver_user else "Unknown",
+            "from_email": req.sender_email,
+            "status": req.status,
+            "timestamp": req.timestamp
+        })
+
+    return jsonify({"sent_transfers": result})
+
+
 @app.route("/accept_transfer/<int:transfer_id>", methods=["POST"])
 @jwt_required()
 def accept_transfer(transfer_id):
-    owner_email = get_jwt_identity()
+    receiver_email = get_jwt_identity()
     pending_transfer = PendingTransferModel.query.get(transfer_id)
 
     if not pending_transfer:
         return jsonify({"error": "Transfer not found"}), 404
 
-    if pending_transfer.receiver_email != owner_email:
+    if pending_transfer.receiver_email != receiver_email:
         return jsonify({"error": "Not authorized"}), 403
 
     # Get the JSON data from the POST request body
@@ -400,14 +771,7 @@ def accept_transfer(transfer_id):
 
     # Use batch_id from URL param or request data
     batch_id = pending_transfer.batch_id
-    # Prepare transaction data for new block
-    data = {
-        "batch_id": batch_id,
-        "owner": owner_email,
-        "conditions": req_data.get("conditions", {}),
-        # Add other needed fields here if applicable
-    }
-
+    
     batch = BatchModel.query.filter_by(batch_id=batch_id).first()
     if not batch:
         return jsonify({"error": "Batch not found"}), 404
@@ -415,26 +779,21 @@ def accept_transfer(transfer_id):
     if batch.status == "Distributed":
         return jsonify({"error": "Blockchain is closed for this product"}), 400
 
-    blockchain = Blockchain()
-    blockchain.load_chain_from_db()
+    # Accept the transfer using blockchain method
+    tx = blockchain.accept_transfer(
+        batch_id=batch_id,
+        receiver_email=receiver_email,
+        conditions=req_data.get("conditions", {})
+    )
+    
+    if not tx:
+        return jsonify({"error": "Failed to accept transfer"}), 400
 
-    # Add block to blockchain
-    previous_hash = blockchain.get_latest_block().hash
-    blockchain.add_block(data)
-
-    # Update batch owner and status
-    batch.current_owner_email = owner_email
-    receiver_user = User.query.filter_by(email=owner_email).first()
-    if receiver_user.role == "distributor":
-        batch.status = "In Distribution"
-    elif receiver_user.role == "retailer":
-        batch.status = "Distributed"
-        batch.blockchain_closed = True
-
+    # Create a new transaction record with the updated owner
     new_tx = TransactionModel(
         batch_id=batch_id,
         product=batch.product_name,
-        owner=owner_email,
+        owner=receiver_email,  # Set owner to the receiver
         location=req_data.get("location", "Unknown"),
         temperature=req_data.get("temperature", "N/A"),
         humidity=req_data.get("humidity", "N/A"),
@@ -447,7 +806,7 @@ def accept_transfer(transfer_id):
     db.session.delete(pending_transfer)
     db.session.commit()
 
-    return jsonify({"message": "Transfer accepted and added to blockchain"}), 200
+    return jsonify({"message": "Transfer accepted and added to blockchain", "transaction": tx}), 200
 
 
 
@@ -494,13 +853,14 @@ def dashboard_stats():
     total = BatchModel.query.count()
     created = BatchModel.query.filter_by(status="Created").count()
     in_transit = BatchModel.query.filter_by(status="In Transit").count()
-    delivered = BatchModel.query.filter_by(status="Delivered").count()
+    in_distribution = BatchModel.query.filter_by(status="In Distribution").count()
+    distributed = BatchModel.query.filter_by(status="Distributed").count()
     rejected = BatchModel.query.filter_by(status="Rejected").count()
 
     return jsonify({
         "total_batches": total,
-        "pending": created + in_transit,
-        "delivered": delivered,
+        "pending": created + in_transit + in_distribution,
+        "delivered": distributed,
         "rejected": rejected
     })
 
@@ -508,30 +868,59 @@ def dashboard_stats():
 @app.route("/my_transactions", methods=["GET"])
 @jwt_required()
 def my_transactions():
-
     user_email = get_jwt_identity()
 
     user = User.query.filter_by(email=user_email).first()
     if not user:
         return jsonify({"error": "User not found"}), 404
 
-    transactions = TransactionModel.query.filter_by(owner=user_email).order_by(TransactionModel.timestamp.desc()).all()
+    # Get all transactions where user is the owner (current owner)
+    owned_transactions = TransactionModel.query.filter_by(owner=user_email).order_by(TransactionModel.timestamp.desc()).all()
 
-    if not transactions:
+    # Get all batches where user is the current owner
+    owned_batches = BatchModel.query.filter_by(current_owner_email=user_email).all()
+    owned_batch_ids = [batch.batch_id for batch in owned_batches]
+
+    # Get all transactions for batches owned by the user
+    all_user_transactions = TransactionModel.query.filter(
+        TransactionModel.batch_id.in_(owned_batch_ids)
+    ).order_by(TransactionModel.timestamp.desc()).all()
+
+    # Combine and deduplicate transactions
+    all_transactions = list(set(owned_transactions + all_user_transactions))
+    all_transactions.sort(key=lambda x: x.timestamp, reverse=True)
+
+    if not all_transactions:
         return jsonify({"transactions": []})
 
-    result = []
-    for tx in transactions:
-        # Fetch batch status (if any)
-        batch = BatchModel.query.filter_by(batch_id=tx.batch_id).first()
-        status = batch.status if batch else "Unknown"
+    # Get all batch information in one query to avoid N+1 problem
+    batch_ids = list(set(tx.batch_id for tx in all_transactions))
+    batches = {batch.batch_id: batch for batch in BatchModel.query.filter(
+        BatchModel.batch_id.in_(batch_ids)
+    ).all()}
 
+    result = []
+    for tx in all_transactions:
+        # Get batch status and current owner from cached data
+        batch = batches.get(tx.batch_id)
+        status = batch.status if batch else "Unknown"
+        current_owner = batch.current_owner_email if batch else tx.owner
+
+        # Determine if this transaction shows ownership transfer
+        is_transfer = tx.owner != current_owner
+        
         result.append({
             "batch_id": tx.batch_id,
             "product": tx.product,
-            "to": tx.owner,
+            "owner": tx.owner,  # Original owner in this transaction
+            "current_owner": current_owner,  # Current owner of the batch
             "date": tx.timestamp,
-            "status": status
+            "status": status,
+            "is_transfer": is_transfer,
+            "location": tx.location,
+            "temperature": tx.temperature,
+            "humidity": tx.humidity,
+            "transport": tx.transport
         })
 
     return jsonify({"transactions": result})
@@ -582,7 +971,8 @@ def my_pending_count():
     if not user:
         return jsonify({"count": 0})
 
-    count = PendingTransferModel.query.filter_by(sender_email=user_email).count()
+    # Count transfers sent TO the user (not FROM the user)
+    count = PendingTransferModel.query.filter_by(receiver_email=user_email, status="pending").count()
     return jsonify({"count": count})
 
 @app.route("/get_users", methods=["GET"])
@@ -601,6 +991,48 @@ def get_users():
         user_list.append(user_data)
 
     return jsonify(user_list)
+
+
+@app.route("/batch_owner/<batch_id>", methods=["GET"])
+@jwt_required()
+def get_batch_owner(batch_id):
+    """Get the current owner of a specific batch"""
+    batch = BatchModel.query.filter_by(batch_id=batch_id).first()
+    
+    if not batch:
+        return jsonify({"error": "Batch not found"}), 404
+    
+    # Get user details for the current owner
+    owner_user = User.query.filter_by(email=batch.current_owner_email).first()
+    
+    return jsonify({
+        "batch_id": batch_id,
+        "current_owner_email": batch.current_owner_email,
+        "current_owner_name": owner_user.name if owner_user else "Unknown",
+        "current_owner_role": owner_user.role if owner_user else "Unknown",
+        "status": batch.status
+    })
+
+
+@app.route("/my_batches", methods=["GET"])
+@jwt_required()
+def my_batches():
+    """Get all batches owned by the current user"""
+    user_email = get_jwt_identity()
+    
+    batches = BatchModel.query.filter_by(current_owner_email=user_email).all()
+    
+    result = []
+    for batch in batches:
+        result.append({
+            "batch_id": batch.batch_id,
+            "product_name": batch.product_name,
+            "status": batch.status,
+            "created_at": batch.created_at,
+            "updated_at": batch.updated_at
+        })
+    
+    return jsonify({"batches": result})
 
 # Main Entry
 if __name__ == "__main__":

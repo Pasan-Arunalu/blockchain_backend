@@ -139,7 +139,6 @@ class Blockchain:
             "timestamp": time.time()
         }
 
-        # Save to DB (Pending Transfer)
         pending = PendingTransferModel(
             batch_id=batch_id,
             sender_email=sender_email,
@@ -185,12 +184,15 @@ class Blockchain:
         if batch:
             batch.current_owner_email = receiver_email
 
-            # If receiver is Retailer → Delivered (Done), else In Transit
+            # Update status based on receiver role
             user = User.query.filter_by(email=receiver_email).first()
-            if user and user.role.lower() == "distributor" or user and user.role.lower() == "retailer":
-                batch.status = "Delivered"
-            else:
-                batch.status = "In Transit"
+            if user:
+                if user.role.lower() == "distributor":
+                    batch.status = "In Distribution"
+                elif user.role.lower() == "retailer":
+                    batch.status = "Distributed"
+                else:
+                    batch.status = "In Transit"
             db.session.commit()
 
         tx["owner"] = tx["owner_email"]
