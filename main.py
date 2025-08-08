@@ -5,11 +5,15 @@ from flask import Flask, jsonify, request, Response
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity, get_jwt
 from werkzeug.security import generate_password_hash, check_password_hash
 
-import datetime, json, matplotlib.pyplot as plt, matplotlib
+import datetime, json
 import matplotlib.dates as mdates
+
+import matplotlib
+matplotlib.use('Agg')  # Use non-GUI backend
+import matplotlib.pyplot as plt
+
 import io
 import base64
-import time
 
 from models import db, TransactionModel, User, BlockModel, PendingTransferModel, BatchModel
 from blockchain import Blockchain
@@ -33,16 +37,6 @@ jwt = JWTManager(app)
 with app.app_context():
     db.create_all()
     blockchain = Blockchain()
-
-
-@app.after_request
-def after_request(response):
-    response.headers.add("Access-Control-Allow-Origin", "http://localhost:5173")
-    response.headers.add("Access-Control-Allow-Headers", "Content-Type,Authorization")
-    response.headers.add("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
-    response.headers.add("Access-Control-Allow-Credentials", "true")
-    return response
-
 
 def role_required(allowed_roles):
     def decorator(func):
@@ -105,9 +99,9 @@ def add_transaction():
                 return jsonify({"error": f"Missing field: {field}"}), 400
 
         # Get user info from JWT
-        email = get_jwt_identity()        # only email
-        claims = get_jwt()                # contains role
-        role = claims.get("role")         # SAFE way to get role
+        email = get_jwt_identity()
+        claims = get_jwt()
+        role = claims.get("role")
         
         print(f"User email: {email}, role: {role}")
 
@@ -233,6 +227,7 @@ def debug_chain():
         })
     return jsonify(chain_data)
 
+
 # Visualization Routes
 @app.route('/visualize/<batch_id>', methods=['GET'])
 @jwt_required()
@@ -334,168 +329,6 @@ def visualize_batch(batch_id):
         "batch_id": batch_id,
         "data_points": len(times)
     })
-
-@app.route('/visualize_html/<batch_id>', methods=['GET'])
-@jwt_required()
-def visualize_batch_html(batch_id):
-    """Render matplotlib chart as HTML with embedded image"""
-    user_email = get_jwt_identity()
-    
-    # Check if user has access to this batch
-    batch = BatchModel.query.filter_by(batch_id=batch_id).first()
-    if not batch:
-        return jsonify({"error": "Batch not found"}), 404
-    
-    # Only allow access if user is the current owner or has transactions for this batch
-    if batch.current_owner_email != user_email:
-        # Check if user has any transactions for this batch
-        user_transaction = TransactionModel.query.filter_by(
-            batch_id=batch_id, 
-            owner=user_email
-        ).first()
-        if not user_transaction:
-            return jsonify({"error": "Access denied. You don't have permission to view this batch data"}), 403
-
-    # Get temperature and humidity data from database transactions
-    transactions = TransactionModel.query.filter_by(batch_id=batch_id).order_by(TransactionModel.timestamp).all()
-    
-    times, temps, humids = [], [], []
-    
-    for tx in transactions:
-        try:
-            # Parse timestamp
-            timestamp = datetime.datetime.strptime(tx.timestamp, "%Y-%m-%d %H:%M:%S")
-            times.append(timestamp)
-            
-            # Parse temperature (remove °C and convert to int)
-            if tx.temperature and tx.temperature != "N/A":
-                temp_value = int(tx.temperature.replace('°C', '').strip())
-                temps.append(temp_value)
-            else:
-                temps.append(None)
-            
-            # Parse humidity (remove % and convert to int)
-            if tx.humidity and tx.humidity != "N/A":
-                humid_value = int(tx.humidity.replace('%', '').strip())
-                humids.append(humid_value)
-            else:
-                humids.append(None)
-                
-        except (ValueError, AttributeError) as e:
-            print(f"Error parsing transaction data: {e}")
-            continue
-
-    if not times:
-        return jsonify({"error": f"No temperature/humidity data found for batch_id {batch_id}"}), 404
-
-    # Create matplotlib figure
-    plt.figure(figsize=(12, 6))
-    
-    # Plot temperature data
-    valid_temp_data = [(t, temp) for t, temp in zip(times, temps) if temp is not None]
-    if valid_temp_data:
-        temp_times, temp_values = zip(*valid_temp_data)
-        plt.plot(temp_times, temp_values, 'r-o', label='Temperature (°C)', linewidth=2, markersize=6)
-    
-    # Plot humidity data
-    valid_humid_data = [(t, humid) for t, humid in zip(times, humids) if humid is not None]
-    if valid_humid_data:
-        humid_times, humid_values = zip(*valid_humid_data)
-        plt.plot(humid_times, humid_values, 'b-s', label='Humidity (%)', linewidth=2, markersize=6)
-    
-    # Customize the plot
-    plt.title(f'Temperature & Humidity Over Time for {batch_id}', fontsize=14, fontweight='bold')
-    plt.xlabel('Timestamp', fontsize=12)
-    plt.ylabel('Value', fontsize=12)
-    plt.legend(fontsize=10)
-    plt.grid(True, alpha=0.3)
-    
-    # Format x-axis dates
-    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
-    plt.gca().xaxis.set_major_locator(mdates.AutoDateLocator())
-    plt.gcf().autofmt_xdate()  # Rotate and align the tick labels
-    
-    # Adjust layout
-    plt.tight_layout()
-    
-    # Save to bytes buffer
-    img_buffer = io.BytesIO()
-    plt.savefig(img_buffer, format='png', dpi=100, bbox_inches='tight')
-    img_buffer.seek(0)
-    
-    # Encode to base64
-    img_base64 = base64.b64encode(img_buffer.getvalue()).decode()
-    
-    # Close the plot to free memory
-    plt.close()
-    
-    # Create HTML with embedded image
-    html_content = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Temperature & Humidity Chart - {batch_id}</title>
-        <style>
-            body {{
-                font-family: Arial, sans-serif;
-                margin: 20px;
-                background-color: #f5f5f5;
-            }}
-            .container {{
-                max-width: 1200px;
-                margin: 0 auto;
-                background-color: white;
-                padding: 20px;
-                border-radius: 8px;
-                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-            }}
-            h1 {{
-                color: #333;
-                text-align: center;
-                margin-bottom: 20px;
-            }}
-            .chart-container {{
-                text-align: center;
-                margin: 20px 0;
-            }}
-            img {{
-                max-width: 100%;
-                height: auto;
-                border: 1px solid #ddd;
-                border-radius: 4px;
-            }}
-            .info {{
-                background-color: #f8f9fa;
-                padding: 15px;
-                border-radius: 4px;
-                margin-top: 20px;
-            }}
-            .info h3 {{
-                margin-top: 0;
-                color: #495057;
-            }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>Temperature & Humidity Monitoring</h1>
-            <div class="chart-container">
-                <img src="data:image/png;base64,{img_base64}" alt="Temperature and Humidity Chart">
-            </div>
-            <div class="info">
-                <h3>Batch Information</h3>
-                <p><strong>Batch ID:</strong> {batch_id}</p>
-                <p><strong>Data Points:</strong> {len(times)}</p>
-                <p><strong>Latest Temperature:</strong> {temps[-1] if temps and temps[-1] is not None else 'N/A'}°C</p>
-                <p><strong>Latest Humidity:</strong> {humids[-1] if humids and humids[-1] is not None else 'N/A'}%</p>
-                <p><strong>Latest Timestamp:</strong> {times[-1].strftime('%Y-%m-%d %H:%M:%S') if times else 'N/A'}</p>
-            </div>
-        </div>
-    </body>
-    </html>
-    """
-    
-    return html_content
 
 
 @app.route('/my_visualizations', methods=['GET'])
@@ -790,17 +623,17 @@ def accept_transfer(transfer_id):
         return jsonify({"error": "Failed to accept transfer"}), 400
 
     # Create a new transaction record with the updated owner
-    new_tx = TransactionModel(
-        batch_id=batch_id,
-        product=batch.product_name,
-        owner=receiver_email,  # Set owner to the receiver
-        location=req_data.get("location", "Unknown"),
-        temperature=req_data.get("temperature", "N/A"),
-        humidity=req_data.get("humidity", "N/A"),
-        transport=req_data.get("transport", "N/A"),
-        timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    )
-    db.session.add(new_tx)
+    # new_tx = TransactionModel(
+    #     batch_id=batch_id,
+    #     product=batch.product_name,
+    #     owner=receiver_email,  # Set owner to the receiver
+    #     location=req_data.get("location", "Unknown"),
+    #     temperature=req_data.get("temperature", "N/A"),
+    #     humidity=req_data.get("humidity", "N/A"),
+    #     transport=req_data.get("transport", "N/A"),
+    #     timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # )
+    # db.session.add(new_tx)
 
     # Remove pending transfer
     db.session.delete(pending_transfer)
