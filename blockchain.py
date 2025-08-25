@@ -3,6 +3,8 @@ from datetime_utils import get_current_timestamp
 from models import db, BlockModel, PendingTransferModel, BatchModel, User
 from dataclasses import dataclass, field
 
+from contract.deploy import push_transaction
+
 @dataclass(frozen=True)
 class Block:
     index: int
@@ -117,6 +119,7 @@ class Blockchain:
             "timestamp": get_current_timestamp()
         }
         self.add_block(tx)
+        push_transaction(tx)
 
         # Save in DB → include product_name
         batch = BatchModel(
@@ -175,6 +178,7 @@ class Blockchain:
 
         # Add to blockchain
         self.add_block(tx)
+        push_transaction(tx)
 
         # Update DB record
         pending.status = "accepted"
@@ -213,6 +217,7 @@ class Blockchain:
             "timestamp": get_current_timestamp()
         }
         self.add_block(tx)
+        push_transaction(tx)
         return tx
 
     def get_batch_history(self, batch_id):
