@@ -1,5 +1,5 @@
 from flask_sqlalchemy import SQLAlchemy
-import time
+from datetime_utils import get_current_timestamp
 
 db = SQLAlchemy()
 
@@ -12,7 +12,7 @@ class TransactionModel(db.Model):
     temperature = db.Column(db.String(10))
     humidity = db.Column(db.String(10))
     transport = db.Column(db.String(50))
-    timestamp = db.Column(db.String(50))
+    timestamp = db.Column(db.Float, nullable=False, default=get_current_timestamp)
 
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -24,7 +24,7 @@ class User(db.Model):
 class BlockModel(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     index = db.Column(db.Integer, nullable=False)
-    timestamp = db.Column(db.String(50), nullable=False)
+    timestamp = db.Column(db.Float, nullable=False, default=get_current_timestamp)
     transactions = db.Column(db.Text, nullable=False)
     previous_hash = db.Column(db.String(64), nullable=False)
     hash = db.Column(db.String(64), nullable=False)
@@ -42,7 +42,8 @@ class BatchModel(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     batch_id = db.Column(db.String(100), unique=True, nullable=False)
     product_name = db.Column(db.String(200), nullable=False)
+    creator_email = db.Column(db.String(200), nullable=False)
     current_owner_email = db.Column(db.String(200), nullable=False)
     status = db.Column(db.String(50), default="Created")  # Created, In Transit, Delivered, Rejected
-    created_at = db.Column(db.Float, default=lambda: time.time())
-    updated_at = db.Column(db.Float, default=time.time, onupdate=time.time)
+    created_at = db.Column(db.Float, default=get_current_timestamp)
+    updated_at = db.Column(db.Float, default=get_current_timestamp, onupdate=get_current_timestamp)

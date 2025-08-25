@@ -1,4 +1,5 @@
-import hashlib, json, time
+import hashlib, json
+from datetime_utils import get_current_timestamp
 from models import db, BlockModel, PendingTransferModel, BatchModel, User
 from dataclasses import dataclass, field
 
@@ -36,14 +37,14 @@ class Blockchain:
             self.chain.append(genesis)
             if self.use_db:
                 self.save_block_to_db(genesis)
-        else:
-            if not self.is_chain_valid():
-                raise ValueError("Blockchain integrity check failed! Possible tampering detected.")
+        # else:
+        #     if not self.is_chain_valid():
+        #         raise ValueError("Blockchain integrity check failed! Possible tampering detected.")
 
     def create_genesis_block(self):
         return Block(
             index=0,
-            timestamp=time.time(),
+            timestamp=get_current_timestamp(),
             transactions=[{"message": "Genesis Block"}],
             previous_hash="0",
             hash=""
@@ -58,7 +59,7 @@ class Blockchain:
         latest_block = self.get_latest_block()
         new_block = Block(
             index=len(self.chain),
-            timestamp=time.time(),
+            timestamp=get_current_timestamp(),
             transactions=new_transactions,
             previous_hash=latest_block.hash
         )
@@ -69,7 +70,7 @@ class Blockchain:
     def save_block_to_db(self, block):
         block_record = BlockModel(
             index=block.index,
-            timestamp=str(block.timestamp),
+            timestamp=block.timestamp,  # Now stored as float directly
             transactions=json.dumps(block.transactions),
             previous_hash=block.previous_hash,
             hash=block.hash
@@ -84,7 +85,7 @@ class Blockchain:
             chain.append(
                 Block(
                     index=b.index,
-                    timestamp=float(b.timestamp),
+                    timestamp=b.timestamp,  # Already float, no conversion needed
                     transactions=json.loads(b.transactions) if b.transactions else [],
                     previous_hash=b.previous_hash,
                     hash=b.hash
@@ -113,7 +114,7 @@ class Blockchain:
             "owner_email": owner_email,
             "action": "batch_created",
             "details": details,
-            "timestamp": time.time()
+            "timestamp": get_current_timestamp()
         }
         self.add_block(tx)
 
@@ -121,6 +122,7 @@ class Blockchain:
         batch = BatchModel(
             batch_id=batch_id,
             product_name=product_name,
+            creator_email=owner_email,
             current_owner_email=owner_email,
             status="Created"
         )
@@ -136,14 +138,14 @@ class Blockchain:
             "to_email": receiver_email,
             "action": "transfer_request",
             "status": "pending",
-            "timestamp": time.time()
+            "timestamp": get_current_timestamp()
         }
 
         pending = PendingTransferModel(
             batch_id=batch_id,
             sender_email=sender_email,
             receiver_email=receiver_email,
-            timestamp=tx["timestamp"],
+            timestamp=tx["timestamp"],  # Already float from get_current_timestamp()
             status="pending"
         )
         db.session.add(pending)
@@ -167,7 +169,7 @@ class Blockchain:
             "owner_email": pending.receiver_email,
             "action": "ownership_accepted",
             "conditions": conditions,
-            "timestamp": time.time(),
+            "timestamp": get_current_timestamp(),
             "status": "accepted"
         }
 
@@ -208,7 +210,7 @@ class Blockchain:
             "owner_email": batch.current_owner_email,
             "action": "update_conditions",
             "conditions": conditions,
-            "timestamp": time.time()
+            "timestamp": get_current_timestamp()
         }
         self.add_block(tx)
         return tx

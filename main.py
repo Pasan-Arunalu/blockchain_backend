@@ -5,8 +5,18 @@ from flask import Flask, jsonify, request, Response
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity, get_jwt
 from werkzeug.security import generate_password_hash, check_password_hash
 
-import datetime, json
+import json
 import matplotlib.dates as mdates
+
+from datetime import datetime
+
+from contract import deploy
+from datetime_utils import (
+    get_current_timestamp, 
+    timestamp_to_string, 
+    timestamp_to_datetime,
+    normalize_timestamp
+)
 
 import matplotlib
 matplotlib.use('Agg')  # Use non-GUI backend
@@ -27,7 +37,7 @@ CORS(app, supports_credentials=True, resources={r"/*": {"origins": "http://local
 app.config["JWT_SECRET_KEY"] = "supersecretkey123"
 app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///supplychain.db"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-app.config["JWT_ACCESS_TOKEN_EXPIRES"] = datetime.timedelta(hours=1)
+app.config["JWT_ACCESS_TOKEN_EXPIRES"] = 3600  # 1 hour in seconds
 
 # Init DB & JWT
 db.init_app(app)
@@ -50,6 +60,12 @@ def role_required(allowed_roles):
             return func(*args, **kwargs)
         return wrapper
     return decorator
+
+def format_timestamp(ts):
+    try:
+        return datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return "Invalid date"
 
 # Routes
 @app.route('/')
@@ -74,7 +90,7 @@ def get_chain():
     for block in blockchain.chain:
         chain_data.append({
             'index': block.index,
-            'timestamp': datetime.datetime.fromtimestamp(block.timestamp).strftime("%Y-%m-%d %H:%M:%S"),
+            'timestamp': timestamp_to_string(block.timestamp),
             'transactions': block.transactions,
             'previous_hash': block.previous_hash,
             'hash': block.hash
@@ -137,7 +153,7 @@ def add_transaction():
             # Continue with the transaction creation
 
         # Save transaction with current user as owner
-        tx_data['timestamp'] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        tx_data['timestamp'] = get_current_timestamp()
         tx_data['owner'] = email  # Set owner to current user
         
         # Remove owner_email field as TransactionModel doesn't have it
@@ -202,7 +218,7 @@ def get_product_history(batch_id):
         if isinstance(tx, dict) and tx.get('batch_id') == batch_id:
             product_history.append({
                 'index': block.index,
-                'timestamp': datetime.datetime.fromtimestamp(block.timestamp).strftime("%Y-%m-%d %H:%M:%S"),
+                'timestamp': timestamp_to_string(block.timestamp),
                 'transactions': tx,
                 'previous_hash': block.previous_hash,
                 'hash': block.hash
@@ -220,7 +236,7 @@ def debug_chain():
     for block in blockchain.chain:
         chain_data.append({
             'index': block.index,
-            'timestamp': datetime.datetime.fromtimestamp(block.timestamp).strftime("%Y-%m-%d %H:%M:%S"),
+            'timestamp': timestamp_to_string(block.timestamp),
             'transactions': block.transactions,
             'previous_hash': block.previous_hash,
             'hash': block.hash
@@ -257,8 +273,8 @@ def visualize_batch(batch_id):
     
     for tx in transactions:
         try:
-            # Parse timestamp
-            timestamp = datetime.datetime.strptime(tx.timestamp, "%Y-%m-%d %H:%M:%S")
+            # Parse timestamp - now stored as float, convert to datetime
+            timestamp = timestamp_to_datetime(tx.timestamp)
             times.append(timestamp)
             
             # Parse temperature (remove °C and convert to int)
@@ -352,8 +368,8 @@ def my_visualizations():
         
         for tx in transactions:
             try:
-                # Parse timestamp
-                timestamp = datetime.datetime.strptime(tx.timestamp, "%Y-%m-%d %H:%M:%S")
+                # Parse timestamp - now stored as float, convert to datetime
+                timestamp = timestamp_to_datetime(tx.timestamp)
                 times.append(timestamp)
                 
                 # Parse temperature
@@ -383,7 +399,7 @@ def my_visualizations():
                 "data_points": len(times),
                 "latest_temperature": temps[-1] if temps and temps[-1] is not None else None,
                 "latest_humidity": humids[-1] if humids and humids[-1] is not None else None,
-                "latest_timestamp": times[-1].strftime("%Y-%m-%d %H:%M:%S") if times else None,
+                "latest_timestamp": timestamp_to_string(times[-1].timestamp()) if times else None,
                 "visualization_url": f"/visualize/{batch.batch_id}",
                 "html_visualization_url": f"/visualize_html/{batch.batch_id}"
             })
@@ -596,15 +612,11 @@ def accept_transfer(transfer_id):
     if pending_transfer.receiver_email != receiver_email:
         return jsonify({"error": "Not authorized"}), 403
 
-    # Get the JSON data from the POST request body
     req_data = request.get_json()
-
     if not req_data:
         return jsonify({"error": "Missing data"}), 400
 
-    # Use batch_id from URL param or request data
     batch_id = pending_transfer.batch_id
-    
     batch = BatchModel.query.filter_by(batch_id=batch_id).first()
     if not batch:
         return jsonify({"error": "Batch not found"}), 404
@@ -612,72 +624,42 @@ def accept_transfer(transfer_id):
     if batch.status == "Distributed":
         return jsonify({"error": "Blockchain is closed for this product"}), 400
 
-    # Accept the transfer using blockchain method
+    # Accept transfer on blockchain
     tx = blockchain.accept_transfer(
         batch_id=batch_id,
         receiver_email=receiver_email,
         conditions=req_data.get("conditions", {})
     )
-    
     if not tx:
         return jsonify({"error": "Failed to accept transfer"}), 400
 
-    # Create a new transaction record with the updated owner
-    # new_tx = TransactionModel(
-    #     batch_id=batch_id,
-    #     product=batch.product_name,
-    #     owner=receiver_email,  # Set owner to the receiver
-    #     location=req_data.get("location", "Unknown"),
-    #     temperature=req_data.get("temperature", "N/A"),
-    #     humidity=req_data.get("humidity", "N/A"),
-    #     transport=req_data.get("transport", "N/A"),
-    #     timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    # )
-    # db.session.add(new_tx)
+    # Create historical record
+    new_tx = TransactionModel(
+        batch_id=batch_id,
+        product=batch.product_name,
+        owner=receiver_email,
+        location=req_data.get("location", "Unknown"),
+        temperature=req_data.get("temperature", "N/A"),
+        humidity=req_data.get("humidity", "N/A"),
+        transport=req_data.get("transport", "N/A"),
+        timestamp=get_current_timestamp()
+    )
+    db.session.add(new_tx)
 
-    # Remove pending transfer
+    # Update batch current owner
+    batch.current_owner_email = receiver_email
+
+    # Update batch status
+    if batch.status == "Created":
+        batch.status = "In Transit"
+    elif batch.status == "In Transit" and User.query.filter_by(email=receiver_email).first().role.lower() == "retailer":
+        batch.status = "Distributed"  # blockchain closed
+
+    # Clean up pending transfer
     db.session.delete(pending_transfer)
     db.session.commit()
 
     return jsonify({"message": "Transfer accepted and added to blockchain", "transaction": tx}), 200
-
-
-
-# @app.route("/reject_transfer", methods=["POST"])
-# @jwt_required()
-# def reject_transfer():
-#     data = request.get_json()
-#     batch_id = data.get("batch_id")
-#     receiver = get_jwt_identity()
-#
-#     pending = PendingTransferModel.query.filter_by(
-#         batch_id=batch_id, receiver=receiver, status="pending"
-#     ).first()
-#     if not pending:
-#         return jsonify({"error": "No pending transfer found"}), 404
-#
-#     # Mark as rejected
-#     pending.status = "rejected"
-#     db.session.commit()
-#
-#     # Update batch status
-#     batch = BatchModel.query.filter_by(batch_id=batch_id).first()
-#     if batch:
-#         batch.status = "Rejected"
-#         db.session.commit()
-#
-#     # Log rejection on blockchain too
-#     tx = {
-#         "batch_id": batch_id,
-#         "from": pending.sender,
-#         "to": receiver,
-#         "action": "transfer_rejected",
-#         "timestamp": time.time(),
-#         "status": "rejected"
-#     }
-#     blockchain.add_block(tx)
-#
-#     return jsonify({"message": "Transfer rejected", "transaction": tx})
 
 
 @app.route("/dashboard_stats", methods=["GET"])
@@ -702,59 +684,65 @@ def dashboard_stats():
 @jwt_required()
 def my_transactions():
     user_email = get_jwt_identity()
-
     user = User.query.filter_by(email=user_email).first()
     if not user:
         return jsonify({"error": "User not found"}), 404
 
-    # Get all transactions where user is the owner (current owner)
-    owned_transactions = TransactionModel.query.filter_by(owner=user_email).order_by(TransactionModel.timestamp.desc()).all()
+    result = []
 
-    # Get all batches where user is the current owner
-    owned_batches = BatchModel.query.filter_by(current_owner_email=user_email).all()
-    owned_batch_ids = [batch.batch_id for batch in owned_batches]
+    # If Farmer → show batches they created (from BatchModel only)
+    if user.role.lower() == "farmer":
+        farmer_batches = BatchModel.query.filter_by(creator_email=user_email).all()
+        for batch in farmer_batches:
+            result.append({
+                "batch_id": batch.batch_id,
+                "product": batch.product_name,
+                "owner": batch.creator_email,   # original farmer
+                "current_owner": batch.current_owner_email,
+                "date": format_timestamp(batch.created_at),
+                "status": batch.status,
+                "is_transfer": False,  # batch creation
+                "location": "N/A",
+                "temperature": "N/A",
+                "humidity": "N/A",
+                "transport": "N/A"
+            })
 
-    # Get all transactions for batches owned by the user
-    all_user_transactions = TransactionModel.query.filter(
-        TransactionModel.batch_id.in_(owned_batch_ids)
-    ).order_by(TransactionModel.timestamp.desc()).all()
+    # Fetch user's transactions (from TransactionModel) EXCEPT farmer's own creation
+    user_transactions = TransactionModel.query.filter_by(owner=user_email).all()
 
-    # Combine and deduplicate transactions
-    all_transactions = list(set(owned_transactions + all_user_transactions))
-    all_transactions.sort(key=lambda x: x.timestamp, reverse=True)
+    # Filter out "creation" duplicates if farmer is viewing
+    if user.role.lower() == "farmer":
+        # Skip transactions where farmer is both the owner AND the creator
+        user_transactions = [
+            tx for tx in user_transactions
+            if not BatchModel.query.filter_by(batch_id=tx.batch_id, creator_email=user_email).first()
+        ]
 
-    if not all_transactions:
-        return jsonify({"transactions": []})
-
-    # Get all batch information in one query to avoid N+1 problem
-    batch_ids = list(set(tx.batch_id for tx in all_transactions))
-    batches = {batch.batch_id: batch for batch in BatchModel.query.filter(
+    # Fetch related batch info
+    batch_ids = [tx.batch_id for tx in user_transactions]
+    batches = {b.batch_id: b for b in BatchModel.query.filter(
         BatchModel.batch_id.in_(batch_ids)
     ).all()}
 
-    result = []
-    for tx in all_transactions:
-        # Get batch status and current owner from cached data
+    for tx in user_transactions:
         batch = batches.get(tx.batch_id)
-        status = batch.status if batch else "Unknown"
-        current_owner = batch.current_owner_email if batch else tx.owner
-
-        # Determine if this transaction shows ownership transfer
-        is_transfer = tx.owner != current_owner
-        
         result.append({
             "batch_id": tx.batch_id,
             "product": tx.product,
-            "owner": tx.owner,  # Original owner in this transaction
-            "current_owner": current_owner,  # Current owner of the batch
-            "date": tx.timestamp,
-            "status": status,
-            "is_transfer": is_transfer,
+            "owner": tx.owner,
+            "current_owner": batch.current_owner_email if batch else tx.owner,
+            "date": format_timestamp(tx.timestamp),
+            "status": batch.status if batch else "Unknown",
+            "is_transfer": True,
             "location": tx.location,
             "temperature": tx.temperature,
             "humidity": tx.humidity,
             "transport": tx.transport
         })
+
+    # Sort by date
+    result.sort(key=lambda x: x["date"], reverse=True)
 
     return jsonify({"transactions": result})
 
@@ -866,6 +854,29 @@ def my_batches():
         })
     
     return jsonify({"batches": result})
+
+
+# smart contract endpoints
+@app.route("/contract/message", methods=["POST"])
+def contract_message():
+    data = request.json
+    tx = deploy.store_message(data["msg"])
+    return jsonify({"message": "Stored in smart contract", "tx": tx})
+
+@app.route("/contract/message", methods=["GET"])
+def contract_get_message():
+    return jsonify({"message": deploy.get_message()})
+
+@app.route("/contract/number", methods=["POST"])
+def contract_number():
+    data = request.json
+    tx = deploy.set_number(int(data["num"]))
+    return jsonify({"message": "Number stored", "tx": tx})
+
+@app.route("/contract/number", methods=["GET"])
+def contract_get_number():
+    return jsonify({"number": deploy.get_number()})
+
 
 # Main Entry
 if __name__ == "__main__":
